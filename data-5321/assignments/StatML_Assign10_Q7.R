@@ -1,0 +1,20 @@
+library(ISLR2)
+library (gam)
+attach(Wage)
+summary(maritl)
+plot(maritl, wage)
+title("Marital Status vs Wage")
+
+summary(jobclass)
+plot(jobclass, wage)
+title("Jobclass vs Wage")
+
+gam.model1 <- gam(wage ~ year + ns(age, df=4), data=Wage)
+gam.model2 <- gam(wage ~ year + ns(age, df=4) + maritl, data=Wage)
+gam.model3 <- gam(wage ~ year + ns(age, df=4) + jobclass, data=Wage)
+gam.model4 <- gam(wage ~ year + ns(age, df=4) + maritl + jobclass, data=Wage)
+
+anova(gam.model1, gam.model2, gam.model4, test="F")
+anova(gam.model1, gam.model3, gam.model4, test="F")
+par(mfrow=c(2,2))
+plot(gam.model4, se=TRUE, col='blue')

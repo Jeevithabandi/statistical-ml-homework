@@ -1,0 +1,227 @@
+---
+title: "Youth Drug Use Modeling"
+author: "Jeevitha Bandi"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(xgboost)
+library(pROC)
+```
+## Load Data
+
+```{r load-data}
+setwd("~/Downloads") 
+load("youth_data.Rdata")
+ls()
+youth_data <- df
+str(youth_data)
+summary(youth_data)
+```
+# Binary Classification (Marijuana Use)
+**Research Question:** Can high levels of emotional stress and poor parental communication predict whether a youth has ever used marijuana?
+```{r}
+# STEP 1: Data Cleaning and Feature Selection
+# We want to model whether a youth has ever used marijuana (binary classification).
+# We filter to only valid Yes/No responses (coded as 1 or 2).
+# Predictors include emotional stress and parental monitoring, which are known behavioral influences.
+# We convert demographic variables to factors to ensure categorical handling during modeling.
+binary_df <- youth_data %>%
+  filter(PRMJEVR2 %in% c(1, 2), !is.na(TALKPROB), !is.na(PRALDLY2)) %>%
+  mutate(
+    marijuana_use = factor(PRMJEVR2, levels = c(2, 1), labels = c("No", "Yes")),
+    SEX = factor(IRSEX),  # Sex is a key demographic predictor
+    RACE = factor(NEWRACE2),  # Race might correlate with cultural/social access
+    parental_monitoring = factor(PRALDLY2),  # Parental monitoring as a behavioral signal
+    stress_level = TALKPROB  # Emotional stress measured from youth responses
+  ) %>%
+  select(marijuana_use, stress_level, parental_monitoring, SEX, RACE, INCOME)
+glimpse(binary_df)
+
+
+# STEP 2: Train-Test Split
+# We split the data into 70% training and 30% testing to evaluate model generalizability.
+# Stratified sampling (via createDataPartition) ensures that class proportions (Yes/No) remain consistent.
+set.seed(123)
+trainIndex <- createDataPartition(binary_df$marijuana_use, p = 0.7, list = FALSE)
+train_bin <- na.omit(binary_df[trainIndex, ])
+test_bin <- na.omit(binary_df[-trainIndex, ])
+
+# STEP 3: Decision Tree
+# Decision trees help us understand what rules define marijuana use.
+# We use method="class" to specify it's a classification problem.
+# This baseline model reveals early predictors and structure of the data.
+tree_bin <- rpart(marijuana_use ~ ., data = train_bin, method = "class")
+rpart.plot(tree_bin, extra = 104) # Visualizes split structure with label annotations
+
+# STEP 4: Random Forest
+# Random forests improve over single trees by combining many (bagging).
+# It handles noise, nonlinearities, and interaction effects better.
+# We use ntree=100 for a stable ensemble size without excessive compute time.
+rf_bin <- randomForest(marijuana_use ~ ., data = train_bin, ntree = 100)
+varImpPlot(rf_bin)# Shows which variables are most influential across all trees
+
+# STEP 5: Gradient Boosting (Binary Classification)
+# Boosting builds trees sequentially, focusing on examples misclassified by prior models.
+# We use the "bernoulli" distribution for binary classification.
+# We set n.trees high (1000) with small learning rate (shrinkage = 0.01) to avoid overfitting.
+# interaction.depth = 3 allows up to 3-way feature combinations.
+# 5-fold cross-validation ensures we stop training at optimal point.
+gbm_bin <- gbm(as.numeric(marijuana_use) - 1 ~ ., 
+               data = train_bin,
+               distribution = "bernoulli", 
+               n.trees = 1000, 
+               shrinkage = 0.01, 
+               interaction.depth = 3,
+               cv.folds = 5)
+# Use CV to get the best tree count — prevents overfitting
+best_iter <- gbm.perf(gbm_bin, method = "cv")
+
+# STEP 6: Prediction and Evaluation
+# Predict marijuana use using the best GBM model
+# We evaluate results using confusion matrix (accuracy, precision, recall)
+# ROC and AUC help us understand the model's ability to separate classes
+pred_gbm_prob <- predict(gbm_bin, test_bin, n.trees = best_iter, type = "response")
+pred_gbm <- ifelse(pred_gbm_prob > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+confusionMatrix(pred_gbm, test_bin$marijuana_use)
+roc_curve <- roc(test_bin$marijuana_use, pred_gbm_prob)
+auc(roc_curve)
+```
+
+# Multi-Class Classification (Cigarette Use Frequency)
+**Research Question:** How frequently do teens from different household and parental support backgrounds use cigarettes?**
+```{r}
+# STEP 1: Data Cleaning and Feature Structuring
+# We are predicting how frequently youth use cigarettes (ordinal multi-class).
+# We filter out rows with invalid or missing frequency data and convert our target to an ordered factor,
+# since the classes (1–7) represent increasing usage frequency.
+multi_df <- youth_data %>%
+  filter(IRCIGFM %in% 1:7, !is.na(PRALDLY2), !is.na(IRCIGAGE)) %>%
+  mutate(
+    cig_freq = factor(IRCIGFM, ordered = TRUE),  # Ordered factor preserves ordinal structure
+    parental_monitoring = factor(PRALDLY2),  # Key behavioral control feature
+    first_use_age = IRCIGAGE,  # Early exposure may correlate with higher frequency
+    SEX = factor(IRSEX),
+    RACE = factor(NEWRACE2)
+  ) %>%
+  select(cig_freq, parental_monitoring, first_use_age, SEX, RACE, INCOME)
+glimpse(multi_df)
+
+
+# STEP 2: Train-Test Split
+# Class stratification isn’t supported directly for ordered factors, but we aim for random balance.
+# Missing values are omitted to prevent model errors.
+set.seed(42)
+train_idx <- createDataPartition(multi_df$cig_freq, p = 0.7, list = FALSE)
+train_multi <- na.omit(multi_df[train_idx, ])
+test_multi <- na.omit(multi_df[-train_idx, ])
+
+# STEP 3: Decision Tree for Ordinal Classification
+# rpart with method="class" creates a baseline tree.
+# Though it treats output as nominal, it's useful for visualizing simple splitting logic.
+multi_tree <- rpart(cig_freq ~ ., data = train_multi, method = "class")
+rpart.plot(multi_tree, extra = 104)
+pred_multi_tree <- predict(multi_tree, test_multi, type = "class")
+confusionMatrix(pred_multi_tree, test_multi$cig_freq)
+
+# STEP 4: Random Forest
+# Builds an ensemble of trees to better capture interaction effects.
+# Can handle noisy multi-class data better, though it treats the target as unordered.
+multi_rf <- randomForest(cig_freq ~ ., data = train_multi, ntree = 100)
+pred_multi_rf <- predict(multi_rf, test_multi)
+confusionMatrix(pred_multi_rf, test_multi$cig_freq)
+varImpPlot(multi_rf) # Identifies most important predictors across forest
+# Use training set summary to check class counts
+print(table(train_multi$cig_freq))
+
+# STEP 5: Gradient Boosting (Multinomial)
+# We switch to a multinomial distribution to handle multi-class target.
+# Interaction depth and shrinkage are tuned low to minimize overfitting in rare classes.
+multi_gbm <- gbm(as.numeric(cig_freq) ~ ., 
+                 data = train_multi,
+                 distribution = "multinomial", 
+                 n.trees = 100,
+                 interaction.depth = 2,
+                 shrinkage = 0.05,
+                 n.minobsinnode = 5,
+                 bag.fraction = 0.5)
+
+
+# STEP 6: Prediction and Evaluation
+# We extract the class with the highest predicted probability for each row.
+# Accuracy is assessed via confusion matrix, although imbalance may dominate.
+gbm_class_preds <- predict(multi_gbm, test_multi, n.trees = 100, type = "response")
+gbm_class_labels <- colnames(gbm_class_preds)[apply(gbm_class_preds, 1, which.max)]
+gbm_class_labels <- factor(gbm_class_labels, levels = levels(multi_df$cig_freq))
+confusionMatrix(gbm_class_labels, test_multi$cig_freq)
+```
+
+# Regression (Alcohol Use Days per Year)
+**Research Question:** Can peer influence predict the number of days alcohol was consumed in the past year?
+```{r}
+# STEP 1: Data Cleaning and Feature Setup
+# We aim to predict the number of days alcohol was consumed in the past year — a numeric target.
+# Outliers (values >= 365) are removed to improve model reliability.
+reg_df <- youth_data %>%
+  filter(IRALCFY < 365, !is.na(IRALCFY), !is.na(PRALDLY2), !is.na(IRSEX), !is.na(NEWRACE2)) %>%
+  mutate(
+    alcohol_days = IRALCFY,
+    parental_monitoring = factor(PRALDLY2),
+    SEX = factor(IRSEX),
+    RACE = factor(NEWRACE2)
+  ) %>%
+  select(alcohol_days, parental_monitoring, SEX, RACE, INCOME)
+glimpse(reg_df)
+
+# STEP 2: Train-Test Split
+# We divide the data for regression modeling and remove any rows with missing values.
+set.seed(101)
+train_idx_reg <- createDataPartition(reg_df$alcohol_days, p = 0.7, list = FALSE)
+train_reg <- na.omit(reg_df[train_idx_reg, ])
+test_reg <- na.omit(reg_df[-train_idx_reg, ])
+
+
+# STEP 3: Regression Tree
+# rpart with method="anova" is used for numeric regression trees.
+# This model gives a basic understanding of how features split based on continuous outcomes.
+tree_reg <- rpart(alcohol_days ~ ., data = train_reg, method = "anova")
+rpart.plot(tree_reg, extra = 101)
+pred_tree_reg <- predict(tree_reg, test_reg)
+postResample(pred_tree_reg, test_reg$alcohol_days)
+# STEP 4: Random Forest (Regression)
+# Random forest smooths out predictions across trees, reducing variance.
+# It handles non-linear relationships and noisy data well.
+rf_reg <- randomForest(alcohol_days ~ ., data = train_reg, ntree = 100)
+pred_rf_reg <- predict(rf_reg, test_reg)
+postResample(pred_rf_reg, test_reg$alcohol_days)
+varImpPlot(rf_reg)
+
+# STEP 5: Gradient Boosting (Gaussian)
+# We use gaussian distribution because our target is continuous.
+# Parameters are chosen to slowly learn patterns, avoiding overfitting.
+# Cross-validation helps determine when to stop boosting.
+gbm_reg <- gbm(alcohol_days ~ ., 
+               data = train_reg,
+               distribution = "gaussian",
+               n.trees = 1000,
+               shrinkage = 0.01,
+               interaction.depth = 3,
+               cv.folds = 5)
+
+# STEP 6: Prediction and Model Performance
+# Predict using best number of trees found via CV
+# Evaluate using RMSE and R-squared to measure fit quality
+best_iter_reg <- gbm.perf(gbm_reg, method = "cv")
+pred_gbm_reg <- predict(gbm_reg, test_reg, n.trees = best_iter_reg)
+postResample(pred_gbm_reg, test_reg$alcohol_days)
+```
